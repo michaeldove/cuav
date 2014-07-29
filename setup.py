@@ -14,21 +14,23 @@ else:
     if os.path.exists("/opt/libjpeg-turbo/lib64/libturbojpeg.so"):
         jpegturbo_libpath = "/opt/libjpeg-turbo/lib64"
     else:
-        jpegturbo_libpath = "/opt/libjpeg-turbo/lib"
-    jpegturbo_incpath = "/opt/libjpeg-turbo/include"
+        #jpegturbo_libpath = "/opt/libjpeg-turbo/lib"
+        jpegturbo_libpath = "/usr/local/Cellar/jpeg-turbo/1.3.1/lib"
+    #jpegturbo_incpath = "/opt/libjpeg-turbo/include"
+    jpegturbo_incpath = "/usr/local/Cellar/jpeg-turbo/1.3.1/include"
     if platform.machine().find('arm') != -1:
         extra_compile_args=["-std=gnu99", "-O3", "-mfpu=neon"]
     else:
         extra_compile_args=["-std=gnu99", "-O3"]
 
-    chameleon = Extension('cuav.camera.chameleon',
-                          sources = ['cuav/camera/chameleon_py.c',
-                                     'cuav/camera/chameleon.c',
-                                     'cuav/camera/chameleon_util.c'],
-                          libraries = ['dc1394', 'm', 'usb-1.0'],
-                          extra_compile_args=extra_compile_args + ['-O0'])
-    ext_modules.append(chameleon)
-
+#    chameleon = Extension('cuav.camera.chameleon',
+#                          sources = ['cuav/camera/chameleon_py.c',
+#                                     'cuav/camera/chameleon.c',
+#                                     'cuav/camera/chameleon_util.c'],
+#                          libraries = ['dc1394', 'm', 'usb-1.0'],
+#                          extra_compile_args=extra_compile_args + ['-O0'])
+#    ext_modules.append(chameleon)
+#
  
 scanner = Extension('cuav.image.scanner',
                     sources = ['cuav/image/scanner.c', 'cuav/image/imageutil.c'],
@@ -46,7 +48,8 @@ setup (name = 'cuav',
        url = 'https://github.com/CanberraUAV/cuav',
        author = 'CanberraUAV',
        install_requires = [ 'pymavlink',
-                            'MAVProxy' ],
+                            'MAVProxy',
+                            'lxml'],
        author_email = 'andrew-cuav@tridgell.net',
        classifiers=['Development Status :: 4 - Beta',
                     'Environment :: Console',
