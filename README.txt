@@ -11,3 +11,9 @@ License
 -------
 
 cuav is released under the GNU General Public License v3 or later
+
+Dependencies
+------------
+
+libjpeg
+jpeg-turbo

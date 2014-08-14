@@ -23,6 +23,13 @@ else:
     else:
         extra_compile_args=["-std=gnu99", "-O3"]
 
+    pgm_utils = Extension('cuav.camera.pgm_utils',
+                          sources = ['cuav/camera/pgm_utils_py.c',],
+                          extra_compile_args=extra_compile_args + ['-O0'])
+    ext_modules.append(pgm_utils)
+
+ 
+
 #    chameleon = Extension('cuav.camera.chameleon',
 #                          sources = ['cuav/camera/chameleon_py.c',
 #                                     'cuav/camera/chameleon.c',
@@ -62,7 +69,8 @@ setup (name = 'cuav',
        license='GPLv3',
        include_dirs = [np.get_include(),
                        jpegturbo_incpath,
-                       'cuav/camera/include'],
+                       'cuav/camera/include',
+ 		       '/usr/local/include'],
        packages = ['cuav', 'cuav.lib', 'cuav.image', 'cuav.camera', 'cuav.uav', 'cuav.modules'],
        scripts = [ 'cuav/tools/geosearch.py', 'cuav/tools/geotag.py',
                    'cuav/tools/cuav_lens.py', 'cuav/tools/agl_mission.py',

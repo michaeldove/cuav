@@ -11,18 +11,11 @@ from MAVProxy.modules.lib import mp_module
 
 from cuav.image import scanner
 from pymavlink import mavutil
-from cuav.lib import cuav_mosaic, mav_position, cuav_util, cuav_joe, block_xmit, cuav_region
+from cuav.lib import mav_position, cuav_util, cuav_joe, block_xmit, cuav_region
 from MAVProxy.modules.lib import mp_settings
-from MAVProxy.modules.lib import mp_image
 from cuav.camera.cam_params import CameraParams
-from MAVProxy.modules.mavproxy_map import mp_slipmap
-
-# allow for replaying of previous flights
-if os.getenv('FAKE_CHAMELEON'):
-    print("Loaded fake chameleon backend")
-    import cuav.camera.fake_chameleon as chameleon
-else:
-    import cuav.camera.chameleon as chameleon
+from cuav.camera.camera import CameraError
+from cuav.lib.image.thumbnail import ExtractThumbs, CompositeThumbnail
 
 class MavSocket:
     '''map block_xmit onto MAVLink data packets'''
@@ -104,8 +97,9 @@ class ChangeImageSetting:
         
 
 class CameraModule(mp_module.MPModule):
-    def __init__(self, mpstate):
+    def __init__(self, mpstate, camera):
         super(CameraModule, self).__init__(mpstate, "camera", "cuav camera control")
+        self.camera = camera
 
         self.running = False
         self.unload_event = threading.Event()
@@ -116,7 +110,6 @@ class CameraModule(mp_module.MPModule):
         self.scan_thread1_h = None
         self.scan_thread2_h = None
         self.transmit_thread_h = None
-        self.view_thread_h = None
 
         from MAVProxy.modules.lib.mp_settings import MPSettings, MPSetting
         self.camera_settings = MPSettings(
@@ -183,7 +176,6 @@ class CameraModule(mp_module.MPModule):
         self.save_queue = Queue.Queue()
         self.scan_queue = Queue.Queue()
         self.transmit_queue = Queue.Queue()
-        self.viewing = False
         self.have_set_gps_time = False
         
         self.c_params = CameraParams(lens=4.0)
@@ -194,7 +186,6 @@ class CameraModule(mp_module.MPModule):
 
         self.last_watch = 0
         self.frame_loss = 0
-        self.boundary = None
         self.boundary_polygon = None
 
         self.bandwidth_used = 0
@@ -224,7 +215,7 @@ class CameraModule(mp_module.MPModule):
 
         self.add_command('camera', self.cmd_camera,
                          'camera control',
-                         ['<start|stop|status|view|noview|boundary>',
+                         ['<start|stop|status|boundary>',
                           'set (CAMERASETTING)'])
         self.add_completion_function('(CAMERASETTING)', self.settings.completion)
         self.add_command('remote', self.cmd_remote, "remote command", ['(COMMAND)'])
@@ -233,7 +224,7 @@ class CameraModule(mp_module.MPModule):
 
     def cmd_camera(self, args):
         '''camera commands'''
-        usage = "usage: camera <start|stop|status|view|noview|boundary|set|image>"
+        usage = "usage: camera <start|stop|status|boundary|set|image>"
         if len(args) == 0:
             print(usage)
             return
@@ -270,19 +261,6 @@ class CameraModule(mp_module.MPModule):
                 self.efficiency,
                 self.bandwidth_used,
                 self.rtt_estimate))
-        elif args[0] == "view":
-            if self.mpstate.map is None:
-                print("Please load map module first")
-                return
-            if not self.viewing:
-                print("Starting image viewer")
-            if self.view_thread_h is None:
-                self.view_thread_h = self.start_thread(self.view_thread)
-            self.viewing = True
-        elif args[0] == "noview":
-            if self.viewing:
-                print("Stopping image viewer")
-            self.viewing = False
         elif args[0] == "set":
             self.camera_settings.command(args[1:])
         elif args[0] == "image":
@@ -293,9 +271,6 @@ class CameraModule(mp_module.MPModule):
             else:
                 self.boundary = args[1]
                 self.boundary_polygon = cuav_util.polygon_load(self.boundary)
-                if self.mpstate.map is not None:
-                    self.mpstate.map.add_object(mp_slipmap.SlipPolygon('boundary', self.boundary_polygon,
-                                                                       layer=1, linewidth=2, colour=(0,0,255)))                
         else:
             print(usage)
 
@@ -314,26 +289,26 @@ class CameraModule(mp_module.MPModule):
         error_count = 0
 
         print('Opening camera')
-        h = chameleon.open(1, self.camera_settings.depth, self.camera_settings.capture_brightness)
+        self.camera.open(1, self.camera_settings.depth, self.camera_settings.capture_brightness)
 
         print('Getting camare base_time')
         while frame_time is None:
             try:
                 im = numpy.zeros((960,1280),dtype='uint8' if self.camera_settings.depth==8 else 'uint16')
                 base_time = time.time()
-                chameleon.trigger(h, False)
-                frame_time, frame_counter, shutter = chameleon.capture(h, 1000, im)
+                self.camera.trigger(False)
+                frame_time, frame_counter, shutter = self.camera.capture(1000, im)
                 base_time -= frame_time
-            except chameleon.error:
+            except CameraError:
                 print('failed to capture')
                 error_count += 1
             if error_count > 3:
                 error_count = 0
                 print('re-opening camera')
-                chameleon.close(h)
-                h = chameleon.open(1, self.camera_settings.depth, self.camera_settings.capture_brightness)
+                self.camera.close()
+                self.camera.open(1, self.camera_settings.depth, self.camera_settings.capture_brightness)
         print('base_time=%f' % base_time)
-        return h, base_time, frame_time
+        return base_time, frame_time
 
     def capture_thread(self):
         '''camera capture thread'''
@@ -355,17 +330,17 @@ class CameraModule(mp_module.MPModule):
 
         while not self.unload_event.wait(0.02):
             if not self.running:            
-                if h is not None:
-                    chameleon.close(h)
-                    h = None
+                if self.camera is not None:
+                    self.camera.close()
+                    self.camera = None
                 continue
 
             try:
-                if h is None:
-                    h, base_time, last_frame_time = self.get_base_time()
+                if not self.camera.is_open():
+                    base_time, last_frame_time = self.get_base_time()
                     last_capture_frame_time = last_frame_time
                     # put into continuous mode
-                    chameleon.trigger(h, True)
+                    self.camera.trigger(True)
 
                 capture_time = time.time()
                 if self.camera_settings.depth == 16:
@@ -373,14 +348,14 @@ class CameraModule(mp_module.MPModule):
                 else:
                     im = numpy.zeros((960,1280),dtype='uint8')
                 if last_gamma != self.camera_settings.gamma:
-                    chameleon.set_gamma(h, self.camera_settings.gamma)
+                    self.camera.set_gamma(self.camera_settings.gamma)
                     last_gamma = self.camera_settings.gamma
                 if last_framerate != int(self.camera_settings.framerate):
-                    chameleon.set_framerate(h, int(self.camera_settings.framerate))
+                    self.camera.set_framerate(int(self.camera_settings.framerate))
                     last_framerate = int(self.camera_settings.framerate)
 
                 # capture an image
-                frame_time, frame_counter, shutter = chameleon.capture(h, 1000, im)
+                frame_time, frame_counter, shutter = self.camera.capture(1000, im)
                 if frame_time < last_capture_frame_time:
                     base_time += 128
                 last_capture_frame_time = frame_time
@@ -414,11 +389,11 @@ class CameraModule(mp_module.MPModule):
                     self.framerate = 1.0 / (frame_time - last_frame_time)
                 last_frame_time = frame_time
                 last_frame_counter = frame_counter
-            except chameleon.error, msg:
+            except CameraError, msg:
                 self.error_count += 1
                 self.error_msg = msg
-        if h is not None:
-            chameleon.close(h)
+        if self.camera is not None:
+            self.camera.close()
 
     def save_thread(self):
         '''image save thread'''
@@ -433,7 +408,7 @@ class CameraModule(mp_module.MPModule):
             frame_count += 1
             if self.camera_settings.save_pgm != 0:
                 if frame_count % self.camera_settings.save_pgm == 0:
-                    chameleon.save_pgm('%s/%s.pgm' % (raw_dir, rawname), im)
+                    self.camera.save_pgm('%s/%s.pgm' % (raw_dir, rawname), im)
 
     def scan_thread(self):
         '''image scanning thread'''
@@ -506,6 +481,7 @@ class CameraModule(mp_module.MPModule):
         skip_count = 0
         self.start_aircraft_bsend()
 
+
         while not self.unload_event.wait(0.02):
             self.bsend.tick(packet_count=1000, max_queue=self.camera_settings.maxqueue1)
             self.bsend2.tick(packet_count=1000, max_queue=self.camera_settings.maxqueue2)
@@ -549,7 +525,7 @@ class CameraModule(mp_module.MPModule):
                     # send a region message with thumbnails to the ground station
                     thumb = None
                     if self.camera_settings.send1:
-                        thumb_img = cuav_mosaic.CompositeThumbnail(cv.GetImage(cv.fromarray(im_full)),
+                        thumb_img = CompositeThumbnail(cv.GetImage(cv.fromarray(im_full)),
                                                                    regions,
                                                                    thumb_size=self.camera_settings.thumbsize)
                         thumb = scanner.jpeg_compress(numpy.ascontiguousarray(cv.GetMat(thumb_img)), self.camera_settings.quality)
@@ -559,7 +535,7 @@ class CameraModule(mp_module.MPModule):
                         buf = cPickle.dumps(pkt, cPickle.HIGHEST_PROTOCOL)
                         self.bsend.set_bandwidth(self.camera_settings.bandwidth)
                         self.bsend.set_packet_loss(self.camera_settings.packet_loss)
-                        # print("sending thumb len=%u" % len(buf))
+                        #print("sending thumb len=%u" % len(buf))
                         self.bsend.send(buf,
                                         dest=(self.camera_settings.gcs_address, self.camera_settings.gcs_view_port),
                                         priority=1)
@@ -570,7 +546,7 @@ class CameraModule(mp_module.MPModule):
                             # remove some of the regions
                             regions = cuav_region.filter_regions(im_full, regions, min_score=self.camera_settings.minscore2,
                                                                  filter_type=self.camera_settings.filter_type)
-                            thumb_img = cuav_mosaic.CompositeThumbnail(cv.GetImage(cv.fromarray(im_full)),
+                            thumb_img = CompositeThumbnail(cv.GetImage(cv.fromarray(im_full)),
                                                                        regions,
                                                                        thumb_size=self.camera_settings.thumbsize)
                             thumb = scanner.jpeg_compress(numpy.ascontiguousarray(cv.GetMat(thumb_img)), self.camera_settings.quality)
@@ -578,7 +554,7 @@ class CameraModule(mp_module.MPModule):
                             
                             buf = cPickle.dumps(pkt, cPickle.HIGHEST_PROTOCOL)
                             self.bsend2.set_bandwidth(self.camera_settings.bandwidth2)
-                            # print("sending thumb2 len=%u" % len(buf))
+                            #print("sending thumb2 len=%u" % len(buf))
                             self.bsend2.send(buf, priority=highscore)
 
             # Base how many images we send on the send queue size
@@ -659,175 +635,6 @@ class CameraModule(mp_module.MPModule):
                                                  dest_port=0, backlog=5, debug=False)
             self.bsend2.set_bandwidth(self.camera_settings.bandwidth2)
 
-
-    def view_thread(self):
-        '''image viewing thread - this runs on the ground station'''
-        from cuav.lib import cuav_mosaic
-        self.start_gcs_bsend()
-        view_window = False
-        image_count = 0
-        thumb_count = 0
-        image_total_bytes = 0
-        jpeg_total_bytes = 0
-        thumb_total_bytes = 0
-        region_count = 0
-        mosaic = None
-        thumbs_received = set()
-        view_dir = os.path.join(self.camera_dir, "view")
-        thumb_dir = os.path.join(self.camera_dir, "thumb")
-        cuav_util.mkdir_p(view_dir)
-        cuav_util.mkdir_p(thumb_dir)
-
-        img_window = mp_image.MPImage(title='Camera')
-
-        self.console.set_status('Images', 'Images %u' % image_count, row=6)
-        self.console.set_status('Lost', 'Lost %u' % 0, row=6)
-        self.console.set_status('Regions', 'Regions %u' % region_count, row=6)
-        self.console.set_status('JPGSize', 'JPGSize %.0f' % 0.0, row=6)
-        self.console.set_status('XMITQ', 'XMITQ %.0f' % 0.0, row=6)
-
-        self.console.set_status('Thumbs', 'Thumbs %u' % thumb_count, row=7)
-        self.console.set_status('ThumbSize', 'ThumbSize %.0f' % 0.0, row=7)
-        self.console.set_status('ImageSize', 'ImageSize %.0f' % 0.0, row=7)
-
-        ack_time = time.time()
-
-        self.camera_settings.set_callback(self.camera_settings_callback)
-        self.image_settings.set_callback(self.image_settings_callback)
-
-        while not self.unload_event.wait(0.02):
-            if not self.viewing:
-                if view_window:
-                    view_window = False
-                continue
-        
-            tnow = time.time()
-            if tnow - ack_time > 0.1:
-                self.bsend.tick(packet_count=1000, max_queue=self.camera_settings.maxqueue1)
-                self.bsend2.tick(packet_count=1000, max_queue=self.camera_settings.maxqueue2)
-                if self.bsend_slave is not None:
-                    self.bsend_slave.tick(packet_count=1000)
-                    ack_time = tnow
-            if not view_window:
-                view_window = True
-                mosaic = cuav_mosaic.Mosaic(slipmap=self.mpstate.map, C=self.c_params,
-                                            camera_settings=self.camera_settings,
-                                            image_settings=self.image_settings,
-                                            thumb_size=self.camera_settings.mosaic_thumbsize)
-                if self.boundary_polygon is not None:
-                    mosaic.set_boundary(self.boundary_polygon)
-                if self.continue_mode:
-                    self.reload_mosaic(mosaic)
-
-            # check for keyboard events
-            mosaic.check_events()
-
-            self.check_requested_images(mosaic)
-
-            buf = self.bsend.recv(0)
-            if buf is None:
-                buf = self.bsend2.recv(0)
-                bsend = self.bsend2
-                self.bsend2.set_bandwidth(self.camera_settings.bandwidth2)
-            else:
-                bsend = self.bsend
-            if buf is None:
-                continue
-
-            try:
-                obj = cPickle.loads(str(buf))
-                if obj == None:
-                    continue
-            except Exception as e:
-                continue
-
-            if self.camera_settings.gcs_slave is not None:
-                if self.bsend_slave is None:
-                    self.bsend_slave = block_xmit.BlockSender(0, bandwidth=self.camera_settings.bandwidth*10, debug=False)
-                # print("send bsend_slave")
-                self.bsend_slave.send(buf,
-                                      dest=(self.camera_settings.gcs_slave, self.camera_settings.gcs_view_port),
-                                      priority=1)
-
-            if isinstance(obj, ThumbPacket):
-                # we've received a set of thumbnails from the plane for a positive hit
-                if obj.frame_time in thumbs_received:
-                    continue
-                thumbs_received.add(obj.frame_time)
-
-                thumb_total_bytes += len(buf)
-
-                # save the thumbnails
-                thumb_filename = '%s/v%s.jpg' % (thumb_dir, cuav_util.frame_time(obj.frame_time))
-                chameleon.save_file(thumb_filename, obj.thumb)
-                composite = cv.LoadImage(thumb_filename)
-                thumbs = cuav_mosaic.ExtractThumbs(composite, len(obj.regions))
-
-                # log the joe positions
-                filename = '%s/v%s.jpg' % (view_dir, cuav_util.frame_time(obj.frame_time))
-                pos = obj.pos
-                self.log_joe_position(pos, obj.frame_time, obj.regions, filename, thumb_filename)
-
-                # update the mosaic and map
-                mosaic.add_regions(obj.regions, thumbs, filename, pos=pos)
-
-                # update console display
-                region_count += len(obj.regions)
-                self.frame_loss = obj.frame_loss
-                self.xmit_queue = obj.xmit_queue
-                thumb_count += 1
-            
-                self.console.set_status('Lost', 'Lost %u' % self.frame_loss, row=6)
-                self.console.set_status('Regions', 'Regions %u' % region_count, row=6)
-                self.console.set_status('XMITQ', 'XMITQ %.0f' % self.xmit_queue, row=6)
-                self.console.set_status('Thumbs', 'Thumbs %u' % thumb_count, row=7)
-                self.console.set_status('ThumbSize', 'ThumbSize %.0f' % (thumb_total_bytes/thumb_count), row=7)
-
-            if isinstance(obj, ImagePacket):
-                # we have an image from the plane
-                image_total_bytes += len(buf)
-
-                self.xmit_queue = obj.xmit_queue
-                self.console.set_status('XMITQ', 'XMITQ %.0f' % self.xmit_queue, row=6)
-
-                # save it to disk
-                filename = '%s/v%s.jpg' % (view_dir, cuav_util.frame_time(obj.frame_time))
-                chameleon.save_file(filename, obj.jpeg)
-                img = cv.LoadImage(filename)
-                if img.width == 1280:
-                    display_img = cv.CreateImage((640, 480), 8, 3)
-                    cv.Resize(img, display_img)
-                else:
-                    display_img = img
-
-                if obj.pos is not None:
-                    mosaic.add_image(obj.frame_time, filename, obj.pos)
-
-                if obj.priority != 0:
-                    print("Downloaded image %s (width %u)" % (filename, img.width))
-                    if img.width >= 1280:
-                        tag_color = (0,0,255)
-                    else:
-                        tag_color = (0,255,0)
-                    mosaic.tag_image(obj.frame_time, tag_color=tag_color)
-                    
-                cv.ConvertScale(display_img, display_img, scale=self.camera_settings.brightness)
-                img_window.set_image(display_img, bgr=True)
-
-                # update console
-                image_count += 1
-                jpeg_total_bytes += len(obj.jpeg)
-                self.jpeg_size = 0.95 * self.jpeg_size + 0.05 * len(obj.jpeg)
-                self.console.set_status('Images', 'Images %u' % image_count, row=6)
-                self.console.set_status('JPGSize', 'JPG Size %.0f' % (jpeg_total_bytes/image_count), row=6)
-                self.console.set_status('ImageSize', 'ImageSize %.0f' % (image_total_bytes/image_count), row=7)
-
-            if isinstance(obj, CommandPacket):
-                self.handle_command_packet(obj, bsend)
-
-            if isinstance(obj, CommandResponse):
-                print('REMOTE: %s' % obj.response)
-
     def start_thread(self, fn):
         '''start a thread running'''
         t = threading.Thread(target=fn)
@@ -845,8 +652,6 @@ class CameraModule(mp_module.MPModule):
             self.scan_thread1.join(1.0)
             self.scan_thread2.join(1.0)
             self.transmit_thread.join(1.0)
-        if self.view_thread_h is not None:
-            self.view_thread.join(1.0)
         print('camera unload OK')
 
     def handle_command_packet(self, obj, bsend):
@@ -988,6 +793,14 @@ class CameraModule(mp_module.MPModule):
         pkt = ChangeImageSetting(setting.name, setting.value)
         self.send_packet(pkt)
 
-def init(mpstate):
+def init(mpstate, camera=None):
     '''initialise module'''
-    return CameraModule(mpstate)
+    if camera is None:
+        if os.getenv('FAKE_CAMERA'):
+            print("Loaded fake chameleon backend")
+            from cuav.camera.fake_camera import FakeCamera
+            camera = FakeCamera(source_dir='../data/sample')
+        else:
+            import cuav.camera.chameleon as camera
+
+    return CameraModule(mpstate, camera)

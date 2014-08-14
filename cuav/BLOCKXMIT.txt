@@ -1,0 +1,5 @@
+Starting a transmission from the aircraft to GCS.
+camera.source.start_aircraft_bsend
+
+Start a transmission from GCS to aircraft.
+camera.source.start_bsend
