@@ -102,6 +102,7 @@ class Mosaic():
         self.display_regions = grid_width*grid_height
         self.regions = []
         self.regions_sorted = []
+        self.regions_hidden = set()
         self.mouse_region = None
         self.ridx_by_frame_time = {}
         self.page = 0
@@ -196,6 +197,8 @@ class Mosaic():
                                         items=[MPMenuItem('Show Image', returnkey='showImage'),
                                                MPMenuItem('Fetch Image', returnkey='fetchImage'),
                                                MPMenuItem('Fetch Image (full)', returnkey='fetchImageFull'),
+                                               MPMenuItem('Hide Page', returnkey='hidePage'),
+                                               MPMenuItem('Unhide All Pages', returnkey='unhideAll'),
                                                view_menu])
         self.image_mosaic.set_popup_menu(self.popup_menu)
 
@@ -215,7 +218,9 @@ class Mosaic():
 
     def set_brightness(self, b):
         '''set mosaic brightness'''
-        self.brightness = b
+        if b != self.brightness:
+            self.brightness = b
+            self.redisplay_mosaic()
 
     def show_region(self, ridx, view_the_image=False):
         '''display a region on the map'''
@@ -240,6 +245,9 @@ class Mosaic():
 
     def view_imagefile(self, filename):
         '''view an image in a zoomable window'''
+        for i in range(len(self.images)):
+            if filename == self.images[i].filename:
+                self.current_view = i
         img = cuav_util.LoadImage(filename)
         (w,h) = cuav_util.image_shape(img)
         for r in self.regions:
@@ -364,20 +372,47 @@ class Mosaic():
         self.boundary = boundary[:]
         self.slipmap.add_object(mp_slipmap.SlipPolygon('boundary', self.boundary, layer=1, linewidth=2, colour=(0,0,255)))
 
+
+    def hide_page(self):
+        '''hide a page of thumbnails in mosaic'''
+        first = self.display_regions * self.page
+        count = self.display_regions
+        if first + count >= len(self.regions_sorted):
+            count = len(self.regions_sorted) - first
+        print("hiding %u regions starting at %u" % (count, first))
+        for i in range(count):
+            r = self.regions_sorted.pop(first)
+            self.regions_hidden.add(r.ridx)
+            self.slipmap.hide_object("region %u" % r.ridx)
+        self.redisplay_mosaic()
+        self.change_page(self.page)
+
+    def unhide_all(self):
+        '''unhide all pages in mosaic'''
+        for ridx in self.regions_hidden:
+            self.regions_sorted.append(self.regions[ridx])
+            self.slipmap.hide_object("region %u" % ridx, hide=False)
+        self.regions_hidden = set()
+        self.redisplay_mosaic()
+
     def change_page(self, page):
         '''change page number'''
         last_page = self.page
         self.page = page
         if self.page < 0:
             self.page = 0
-        if self.page > len(self.regions) / self.display_regions:
-            self.page = len(self.regions) / self.display_regions
+        max_page = (len(self.regions_sorted)-1) / self.display_regions
+        if max_page < 0:
+            max_page = 0
+        if self.page > max_page:
+            self.page = max_page
         if last_page != self.page:
-            print("Page %u" % self.page)
+            print("Page %u/%u" % (self.page, max_page))
             self.redisplay_mosaic()
 
     def re_sort(self):
         '''re sort the mosaic'''
+        print("Sorting by %s" % self.sort_type)
         sortby = self.sort_type
         if sortby == 'Score':
             self.regions_sorted.sort(key = lambda r : r.score, reverse=True)
@@ -388,8 +423,10 @@ class Mosaic():
         elif sortby == 'Whiteness':
             self.regions_sorted.sort(key = lambda r : r.region.whiteness, reverse=True)
         elif sortby == 'Time':
-            self.regions_sorted.sort(key = lambda r : r.ridx, reverse=True)
-
+            self.regions_sorted.sort(key = lambda r : r.ridx, reverse=False)
+        else:
+            print("Unknown sort by '%s'" % sortby)
+            
     def menu_event(self, event):
         '''called on menu events on the mosaic'''
         if event.returnkey == 'setSort':
@@ -397,14 +434,15 @@ class Mosaic():
             sortby = sortby.split('\t')[0]
             self.sort_type = sortby
             self.re_sort()
+            self.redisplay_mosaic()
         elif event.returnkey == 'nextPage':
             self.change_page(self.page + 1)
         elif event.returnkey == 'previousPage':
             self.change_page(self.page - 1)
         elif event.returnkey == 'increaseBrightness':
-            self.brightness *= 1.25
+            self.set_brightness(self.brightness * 1.25)
         elif event.returnkey == 'decreaseBrightness':
-            self.brightness /= 1.25
+            self.set_brightness(self.brightness / 1.25)
         elif event.returnkey == 'showImage':
             region = self.pos_to_region(event.popup_pos)
             self.popup_show_image(region)
@@ -419,6 +457,10 @@ class Mosaic():
             self.has_started = True
         elif event.returnkey == 'menuStop':
             self.has_started = False
+        elif event.returnkey == 'hidePage':
+            self.hide_page()
+        elif event.returnkey == 'unhideAll':
+            self.unhide_all()
         elif event.returnkey == 'classify':
             r = self.mouse_region
             if r is None:
@@ -475,10 +517,10 @@ class Mosaic():
     def menu_event_view(self, event):
         '''called on menu events on the view image'''
         if event.returnkey == 'increaseBrightness':
-            self.brightness *= 1.25
+            self.set_brightness(self.brightness * 1.25)
             self.view_image.set_brightness(self.brightness)
         elif event.returnkey == 'decreaseBrightness':
-            self.brightness /= 1.25
+            self.set_brightness(self.brightness / 1.25)
             self.view_image.set_brightness(self.brightness)
         elif event.returnkey == 'fitWindow':
             self.view_image.fit_to_window()
@@ -499,7 +541,7 @@ class Mosaic():
         y = pos.y
         page_idx = (x/self.thumb_size) + (self.width/self.thumb_size)*(y/self.thumb_size)
         ridx = page_idx + self.page * self.display_regions
-        if ridx >= len(self.regions):
+        if ridx < 0 or ridx >= len(self.regions_sorted):
             return None
         return self.regions_sorted[ridx]
 
@@ -559,15 +601,26 @@ class Mosaic():
     def key_event(self, event):
         '''called on key events'''
         pass
+
+    def region_on_page(self, ridx, page):
+        '''return True if a region is on the given page.
+        ridx is an index into regions_sorted[]'''
+        if ridx < 0 or ridx >= len(self.regions_sorted):
+            return False
+        width = (self.width // self.thumb_size) * self.thumb_size
+        page_idx = ridx - page * self.display_regions
+        if page_idx < 0 or page_idx >= self.display_regions:
+            # its not on this page
+            return False
+        return True
     
     def display_mosaic_region(self, ridx):
         '''display a thumbnail on the mosaic'''
+        if not self.region_on_page(ridx, self.page):
+            return
         region = self.regions_sorted[ridx]
         width = (self.width // self.thumb_size) * self.thumb_size
         page_idx = ridx - self.page * self.display_regions
-        if page_idx < 0 or page_idx >= self.display_regions:
-            # its not on this page
-            return
         dest_x = (page_idx * self.thumb_size) % width
         dest_y = ((page_idx * self.thumb_size) / width) * self.thumb_size
 
@@ -590,7 +643,7 @@ class Mosaic():
         height = (self.height // self.thumb_size) * self.thumb_size
         self.mosaic = cv.CreateImage((width,height),8,3)
         cuav_util.zero_image(self.mosaic)
-        for ridx in range(len(self.regions)):
+        for ridx in range(len(self.regions_sorted)):
             self.display_mosaic_region(ridx)
         if self.brightness != 1.0:
             cv.ConvertScale(self.mosaic, self.mosaic, scale=self.brightness)
@@ -640,7 +693,7 @@ class Mosaic():
             else:
                 self.ridx_by_frame_time[frame_time].append(ridx)
 
-            self.display_mosaic_region(ridx)
+            self.display_mosaic_region(len(self.regions_sorted)-1)
 
             if (lat,lon) != (None,None):
                 self.slipmap.add_object(mp_slipmap.SlipThumbnail("region %u" % ridx, (lat,lon),

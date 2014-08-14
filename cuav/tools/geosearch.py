@@ -72,6 +72,16 @@ def process(args):
                                          follow=True,
                                          trail=mp_slipmap.SlipTrail()))
 
+  for flag in opts.flag:
+    a = flag.split(',')
+    lat = a[0]
+    lon = a[1]
+    icon = 'flag.png'
+    if len(a) > 2:
+      icon = a[2] + '.png'
+      icon = slipmap.icon(icon)
+      slipmap.add_object(mp_slipmap.SlipIcon('icon - %s' % str(flag), (float(lat),float(lon)), icon, layer=3, rotation=0, follow=False))
+
   if opts.mission:
     from pymavlink import mavwp
     wp = mavwp.MAVWPLoader()
@@ -111,9 +121,10 @@ def process(args):
   camera_settings = MPSettings(
     [ MPSetting('roll_stabilised', bool, opts.roll_stabilised, 'Roll Stabilised'),
       MPSetting('altitude', int, opts.altitude, 'Altitude', range=(0,10000), increment=1),
+      MPSetting('minalt', int, 30, 'MinAltitude', range=(0,10000), increment=1),
+      MPSetting('mpp100', float, 0.0977, 'MPPat100m', range=(0,10000), increment=0.001),
       MPSetting('filter_type', str, 'simple', 'Filter Type',
                 choice=['simple', 'compactness']),
-      MPSetting('fullres', bool, opts.fullres, 'Full Resolution'),
       MPSetting('quality', int, 75, 'Compression Quality', range=(1,100), increment=1),
       MPSetting('thumbsize', int, opts.thumbsize, 'Thumbnail Size', range=(10, 200), increment=1),
       MPSetting('minscore', int, opts.minscore, 'Min Score', range=(0,1000), increment=1, tab='Scoring'),
@@ -213,10 +224,7 @@ def process(args):
       total_time = 0
 
       t0=time.time()
-      if camera_settings.fullres:
-        img_scan = im_full
-      else:
-        img_scan = im_640
+      img_scan = im_full
 
       scan_parms = {}
       for name in image_settings.list():
@@ -225,9 +233,11 @@ def process(args):
 
       if pos is not None:
         (sw,sh) = cuav_util.image_shape(img_scan)
-        mpp = cuav_util.meters_per_pixel(pos, C=C_params)
-        if mpp is not None:
-          scan_parms['MetersPerPixel'] = mpp * (w/float(sw))
+        altitude = pos.altitude
+        if altitude < camera_settings.minalt:
+          altitude = camera_settings.minalt
+        scan_parms['MetersPerPixel'] = camera_settings.mpp100 * altitude / 100.0
+
         regions = scanner.scan(img_scan, scan_parms)
       else:
         regions = scanner.scan(img_scan)
@@ -243,14 +253,14 @@ def process(args):
 
       scan_count += 1
 
-      mosaic.add_image(pos.time, f, pos)
-
       if pos and len(regions) > 0:
         altitude = camera_settings.altitude
         if altitude <= 0:
           altitude = None
         joelog.add_regions(frame_time, regions, pos, f, width=w, height=h,
                            altitude=altitude)
+
+      mosaic.add_image(pos.time, f, pos)
 
       region_count += len(regions)
 
@@ -295,14 +305,13 @@ def parse_args():
   parser.add_option("--mavlog", default=None, type=file_type, help="MAVLink telemetry log file")
   parser.add_option("--kmzlog", default=None, type=file_type, help="kmz file for image positions")
   parser.add_option("--triggerlog", default=None, type=file_type, help="robota trigger file for image positions")
-  parser.add_option("--time-offset", type='int', default=0, help="offset between camera and mavlink log times (seconds)")
+  parser.add_option("--time-offset", type='float', default=0, help="offset between camera and mavlink log times (seconds)")
   parser.add_option("--view", action='store_true', default=False, help="show images")
   parser.add_option("--lens", default=28.0, type='float', help="lens focal length")
   parser.add_option("--sensorwidth", default=35.0, type='float', help="sensor width")
   parser.add_option("--service", default='MicrosoftSat', help="map service")
   parser.add_option("--camera-params", default=None, type=file_type, help="camera calibration json file from OpenCV")
   parser.add_option("--debug", default=False, action='store_true', help="enable debug info")
-  parser.add_option("--fullres", default=False, action='store_true', help="use full camera resolution")
   parser.add_option("--roll-stabilised", default=False, action='store_true', help="assume roll stabilised camera")
   parser.add_option("--altitude", default=0, type='float', help="altitude (0 for auto)")
   parser.add_option("--thumbsize", default=60, type='int', help="thumbnail size")
@@ -310,6 +319,7 @@ def parse_args():
   parser.add_option("--minscore", default=700, type='int', help="minimum score")
   parser.add_option("--gammalog", default=None, type='str', help="gamma.log from flight")
   parser.add_option("--categories", default=None, type=str, help="xml file containing categories for classification")
+  parser.add_option("--flag", default=[], type='str', action='append', help="flag positions")
   return parser.parse_args()
 
 if __name__ == '__main__':

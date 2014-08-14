@@ -124,6 +124,8 @@ class CameraModule(mp_module.MPModule):
         self.scan_thread2_h = None
         self.transmit_thread_h = None
         self.view_thread_h = None
+        self.flying = True
+        self.terrain_alt = None
 
         from MAVProxy.modules.lib.mp_settings import MPSettings, MPSetting
         self.camera_settings = MPSettings(
@@ -133,12 +135,13 @@ class CameraModule(mp_module.MPModule):
               MPSetting('gamma', int, 950, 'Capture Gamma', range=(0,1000), increment=1),
               MPSetting('roll_stabilised', bool, True, 'Roll Stabilised'),
               MPSetting('altitude', int, 0, 'Altitude', range=(0,10000), increment=1),
+              MPSetting('minalt', int, 30, 'MinAltitude', range=(0,10000), increment=1),
+              MPSetting('mpp100', float, 0.0977, 'MPPat100m', range=(0,10000), increment=0.001),
               MPSetting('filter_type', str, 'simple', 'Filter Type',
                         choice=['simple', 'compactness']),
-              MPSetting('fullres', bool, False, 'Full Resolution'),
               MPSetting('framerate', str, 7, 'Frame Rate', choice=['1', '3', '7', '15']),
               MPSetting('process_divider', int, 1, 'Process Divider', range=(1,50), increment=1),
-              MPSetting('use_capture_time', bool, False, 'Use Capture Time'),
+              MPSetting('use_capture_time', bool, True, 'Use Capture Time'),
 
               MPSetting('gcs_address', str, None, 'GCS Address', tab='GCS'),
               MPSetting('gcs_view_port', int, 7543, 'GCS View Port', range=(1, 30000), increment=1),
@@ -155,6 +158,7 @@ class CameraModule(mp_module.MPModule):
               MPSetting('thumbsize', int, 60, 'Thumbnail Size', range=(10, 200), increment=1),
               MPSetting('mosaic_thumbsize', int, 35, 'Mosaic Thumbnail Size', range=(10, 200), increment=1),
               MPSetting('use_bsend2', bool, True, 'Enable Link2'),
+              MPSetting('minspeed', int, 4, 'Min vehicle speed to save images'),
 
               MPSetting('minscore', int, 75, 'Min Score Link1', range=(0,1000), increment=1, tab='Scoring'),
               MPSetting('minscore2', int, 500, 'Min Score Link2', range=(0,1000), increment=1),
@@ -438,7 +442,7 @@ class CameraModule(mp_module.MPModule):
             (frame_time,im) = self.save_queue.get()
             rawname = "raw%s" % cuav_util.frame_time(frame_time)
             frame_count += 1
-            if self.camera_settings.save_pgm != 0:
+            if self.camera_settings.save_pgm != 0 and self.flying:
                 if frame_count % self.camera_settings.save_pgm == 0:
                     chameleon.save_pgm('%s/%s.pgm' % (raw_dir, rawname), im)
 
@@ -457,16 +461,19 @@ class CameraModule(mp_module.MPModule):
             for name in self.image_settings.list():
                 scan_parms[name] = self.image_settings.get(name)
             scan_parms['SaveIntermediate'] = float(scan_parms['SaveIntermediate'])
+
+            if self.terrain_alt is not None:
+                altitude = self.terrain_alt
+                if altitude < self.camera_settings.minalt:
+                    altitude = self.camera_settings.minalt
+                scan_parms['MetersPerPixel'] = self.camera_settings.mpp100 * altitude / 100.0
             
             t1 = time.time()
             im_full = numpy.zeros((960,1280,3),dtype='uint8')
             im_640 = numpy.zeros((480,640,3),dtype='uint8')
             scanner.debayer(im, im_full)
             scanner.downsample(im_full, im_640)
-            if self.camera_settings.fullres:
-                img_scan = im_full
-            else:
-                img_scan = im_640
+            img_scan = im_full
             regions = scanner.scan(img_scan)
             if self.camera_settings.filter_type=='compactness':
                 calculate_compactness = True
@@ -910,6 +917,10 @@ class CameraModule(mp_module.MPModule):
         if m.get_type() == 'SYSTEM_TIME' and self.camera_settings.clock_sync and self.capture_thread_h is not None:
             # optionally sync system clock on the capture side
             self.sync_gps_clock(m.time_unix_usec)
+        if m.get_type() == 'VFR_HUD':
+            self.flying = m.airspeed > self.camera_settings.minspeed or m.groundspeed > self.camera_settings.minspeed
+        if m.get_type() == "TERRAIN_REPORT":
+            self.terrain_alt = m.current_height
 
     def sync_gps_clock(self, time_usec):
         '''sync system clock with GPS time'''
