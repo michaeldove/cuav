@@ -1,0 +1,15 @@
+The transmitter
+---------------
+
+Drop in the pgm files into data/samples for the fake camera to use.
+
+export FAKE_CAMERA=1
+
+mavproxy --master <sim output> --out udp:192.168.1.1:14550 --load-module cuav.modules.camera.source
+camera start
+
+
+The receiver
+------------
+
+mavproxy --master udp:192.168.1.1:14550 --load-module cuav.modules.camera.client
